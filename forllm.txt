@@ -1,0 +1,818 @@
+# Projet : medtech-edge
+# 13 fichiers concaténés
+
+## Arborescence
+medtech-edge/
+  src/medtech_edge/ingestion/__init__.py
+  src/medtech_edge/ingestion/__main__.py
+  src/medtech_edge/ingestion/bulk.py
+  src/medtech_edge/ingestion/cli.py
+  src/medtech_edge/ingestion/client.py
+  src/medtech_edge/ingestion/config.py
+  src/medtech_edge/ingestion/storage.py
+  src/medtech_edge/ingestion/verify.py
+  src/medtech_edge/__init__.py
+  tests/test_ingestion.py
+  .gitignore
+  pyproject.toml
+  README.md
+
+================================================================================
+FILE: src/medtech_edge/ingestion/__init__.py
+================================================================================
+"""Ingestion des données brutes : téléchargement fiable, vérifié, immuable."""
+from .config import DEFAULT_ENDPOINTS, ENDPOINTS, Settings
+
+__all__ = ["ENDPOINTS", "DEFAULT_ENDPOINTS", "Settings"]
+
+================================================================================
+FILE: src/medtech_edge/ingestion/__main__.py
+================================================================================
+from .cli import main
+
+raise SystemExit(main())
+
+================================================================================
+FILE: src/medtech_edge/ingestion/bulk.py
+================================================================================
+"""Ingestion par fichiers complets openFDA (download.json) vers data/raw, de façon idempotente."""
+from __future__ import annotations
+
+import logging
+import uuid
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from urllib.parse import urlparse
+
+from .client import FdaClient, FetchError
+from .config import ALLOWED_DOWNLOAD_HOSTS, DOWNLOAD_INDEX_URL, SOURCE, Endpoint, Settings
+from .storage import Manifest, publish_readonly, safe_segment, sha256_file
+from .verify import IntegrityError, verify_zip
+
+log = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class Partition:
+    endpoint: Endpoint
+    export_date: str
+    url: str
+    expected_records: int | None
+
+
+@dataclass
+class Result:
+    partition: Partition
+    status: str  # planned | downloaded | skipped | adopted | failed
+    path: Path | None = None
+    error: str | None = None
+
+
+def _check_url(url: str) -> str:
+    parsed = urlparse(url)
+    if parsed.scheme != "https" or parsed.hostname not in ALLOWED_DOWNLOAD_HOSTS:
+        raise FetchError(f"URL refusée (hôte non autorisé) : {url}")
+    name = safe_segment(Path(parsed.path).name)
+    if not name.endswith(".json.zip"):
+        raise FetchError(f"Nom de fichier inattendu : {url}")
+    return name
+
+
+def plan(client: FdaClient, endpoints: list[Endpoint], index_url: str = DOWNLOAD_INDEX_URL) -> list[Partition]:
+    index = client.get_json(index_url)
+    parts: list[Partition] = []
+    for ep in endpoints:
+        try:
+            node = index["results"][ep.category][ep.key]
+            export_date = str(node["export_date"])
+            partitions = node["partitions"]
+        except (KeyError, TypeError) as e:
+            available = sorted(index.get("results", {}).get(ep.category, {})) if isinstance(index, dict) else []
+            raise FetchError(f"Endpoint {ep.category}/{ep.key} absent de l'index (disponibles : {available})") from e
+        for p in partitions:
+            _check_url(p["file"])
+            try:
+                n = int(p.get("records"))
+            except (TypeError, ValueError):
+                n = None
+            parts.append(Partition(ep, export_date, p["file"], n))
+    return parts
+
+
+def dest_for(settings: Settings, p: Partition) -> Path:
+    return (settings.raw_dir / SOURCE / p.endpoint.category / p.endpoint.name
+            / safe_segment(p.export_date) / _check_url(p.url))
+
+
+def _record(settings: Settings, p: Partition, dest: Path, sha: str, info: dict, **extra) -> dict:
+    return {
+        "source": SOURCE,
+        "endpoint": f"{p.endpoint.category}/{p.endpoint.name}",
+        "export_date": p.export_date,
+        "url": p.url,
+        "path": dest.relative_to(settings.raw_dir).as_posix(),
+        "sha256": sha,
+        "bytes": dest.stat().st_size,
+        "member": info["member"],
+        "uncompressed_bytes": info["uncompressed_bytes"],
+        "expected_records": p.expected_records,
+        "fetched_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        **extra,
+    }
+
+
+def fetch_partition(client: FdaClient, settings: Settings, manifest: Manifest,
+                    known: dict[str, dict], p: Partition) -> Result:
+    dest = dest_for(settings, p)
+    rel = dest.relative_to(settings.raw_dir).as_posix()
+
+    if dest.exists():  # snapshot déjà présent : on ne retélécharge ni n'écrase jamais
+        info = verify_zip(dest)
+        if rel in known:
+            return Result(p, "skipped", dest)
+        rec = _record(settings, p, dest, sha256_file(dest), info, adopted=True)
+        manifest.append(rec)
+        known[rel] = rec
+        return Result(p, "adopted", dest)
+
+    settings.tmp_dir.mkdir(parents=True, exist_ok=True)
+    tmp = settings.tmp_dir / f"{uuid.uuid4().hex}.part"
+    try:
+        sha, _ = client.download(p.url, tmp)
+        info = verify_zip(tmp)
+        publish_readonly(tmp, dest)
+        rec = _record(settings, p, dest, sha, info)
+        manifest.append(rec)
+        known[rel] = rec
+        return Result(p, "downloaded", dest)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def run(client: FdaClient, settings: Settings, endpoints: list[Endpoint], dry_run: bool = False) -> list[Result]:
+    parts = plan(client, endpoints)
+    if dry_run:
+        return [Result(p, "planned", dest_for(settings, p)) for p in parts]
+    manifest = Manifest(settings.manifest_path)
+    known = manifest.by_path()
+    results: list[Result] = []
+    for p in parts:
+        try:
+            r = fetch_partition(client, settings, manifest, known, p)
+        except (FetchError, IntegrityError, OSError) as e:
+            log.error("ÉCHEC %s : %s", p.url, e)
+            r = Result(p, "failed", None, str(e))
+        results.append(r)
+    return results
+
+
+def verify_all(settings: Settings) -> list[str]:
+    """Recontrôle tous les fichiers du manifeste (présence, taille, sha256, zip) + orphelins."""
+    problems: list[str] = []
+    records = Manifest(settings.manifest_path).records()
+    listed = set()
+    for rec in records:
+        listed.add(rec["path"])
+        f = settings.raw_dir / rec["path"]
+        if not f.exists():
+            problems.append(f"MANQUANT : {rec['path']}")
+        elif f.stat().st_size != rec["bytes"]:
+            problems.append(f"TAILLE DIFFÉRENTE : {rec['path']}")
+        elif sha256_file(f) != rec["sha256"]:
+            problems.append(f"SHA256 DIFFÉRENT : {rec['path']}")
+        else:
+            try:
+                verify_zip(f)
+            except IntegrityError as e:
+                problems.append(f"CORROMPU : {e}")
+    for f in (settings.raw_dir / SOURCE).rglob("*.json.zip") if (settings.raw_dir / SOURCE).exists() else []:
+        if f.relative_to(settings.raw_dir).as_posix() not in listed:
+            problems.append(f"NON RÉFÉRENCÉ : {f.relative_to(settings.raw_dir).as_posix()}")
+    return problems
+
+================================================================================
+FILE: src/medtech_edge/ingestion/cli.py
+================================================================================
+"""CLI : python -m medtech_edge.ingestion {list,fetch,verify}"""
+from __future__ import annotations
+
+import argparse
+import logging
+import sys
+from collections import Counter
+from pathlib import Path
+
+from . import bulk
+from .client import FdaClient, FetchError
+from .config import DEFAULT_ENDPOINTS, ENDPOINTS, Settings
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="medtech-edge-ingest", description=__doc__)
+    p.add_argument("--raw-dir", type=Path, default=Settings().raw_dir)
+    p.add_argument("-v", "--verbose", action="store_true")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    for name, help_ in (("list", "Voir les exports disponibles côté FDA"),
+                        ("fetch", "Télécharger vers data/raw")):
+        s = sub.add_parser(name, help=help_)
+        s.add_argument("--endpoints", nargs="+", choices=sorted(ENDPOINTS), default=list(DEFAULT_ENDPOINTS))
+        if name == "fetch":
+            s.add_argument("--dry-run", action="store_true", help="Planifier sans écrire")
+    sub.add_parser("verify", help="Recontrôler l'intégrité de data/raw")
+    return p
+
+
+def main(argv: list[str] | None = None, client: FdaClient | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
+                        format="%(asctime)s %(levelname)s %(message)s")
+    settings = Settings(raw_dir=args.raw_dir)
+
+    if args.cmd == "verify":
+        problems = bulk.verify_all(settings)
+        for line in problems:
+            print(line)
+        print("OK : intégrité confirmée" if not problems else f"{len(problems)} problème(s)")
+        return 1 if problems else 0
+
+    client = client or FdaClient(settings)
+    endpoints = [ENDPOINTS[n] for n in args.endpoints]
+    try:
+        results = bulk.run(client, settings, endpoints, dry_run=(args.cmd == "list" or args.dry_run))
+    except FetchError as e:
+        print(f"Erreur : {e}", file=sys.stderr)
+        return 2
+
+    if args.cmd == "list":
+        seen = {}
+        for r in results:
+            seen.setdefault(r.partition.endpoint.name, [r.partition.export_date, 0])[1] += 1
+        for name, (date, n) in seen.items():
+            print(f"{name:20s} export {date}  {n} fichier(s)")
+        return 0
+
+    counts = Counter(r.status for r in results)
+    print(", ".join(f"{k}={v}" for k, v in sorted(counts.items())) or "rien à faire")
+    for r in results:
+        if r.status == "failed":
+            print(f"ÉCHEC {r.partition.url} : {r.error}", file=sys.stderr)
+    return 1 if counts.get("failed") else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
+================================================================================
+FILE: src/medtech_edge/ingestion/client.py
+================================================================================
+"""Client HTTP (bibliothèque standard) avec retries, backoff et contrôle d'intégrité."""
+from __future__ import annotations
+
+import hashlib
+import http.client
+import json
+import logging
+import os
+import random
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+from typing import Any, Callable
+
+from .config import USER_AGENT, Settings
+
+log = logging.getLogger(__name__)
+
+RETRY_STATUS = frozenset({408, 425, 429, 500, 502, 503, 504})
+
+
+class FetchError(RuntimeError):
+    """Échec définitif d'un téléchargement (après retries éventuels)."""
+
+
+class _Retryable(Exception):
+    def __init__(self, msg: str, retry_after: float | None = None):
+        super().__init__(msg)
+        self.retry_after = retry_after
+
+
+def _retry_after(headers: Any) -> float | None:
+    try:
+        value = headers.get("Retry-After") if headers else None
+        return float(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+class FdaClient:
+    def __init__(
+        self,
+        settings: Settings,
+        opener: Callable[..., Any] | None = None,
+        sleep: Callable[[float], None] = time.sleep,
+    ):
+        self.s = settings
+        self._open = opener or urllib.request.build_opener().open
+        self._sleep = sleep
+        self._last = 0.0
+
+    # -- internes ---------------------------------------------------------
+    def _request(self, url: str) -> urllib.request.Request:
+        return urllib.request.Request(
+            url, headers={"User-Agent": USER_AGENT, "Accept-Encoding": "identity"}
+        )
+
+    def _throttle(self) -> None:
+        wait = self.s.min_interval - (time.monotonic() - self._last)
+        if wait > 0:
+            self._sleep(wait)
+        self._last = time.monotonic()
+
+    def _with_retries(self, url: str, action: Callable[[], Any]) -> Any:
+        last: Exception | None = None
+        for attempt in range(1, self.s.max_retries + 1):
+            self._throttle()
+            hint: float | None = None
+            try:
+                return action()
+            except _Retryable as e:
+                last, hint = e, e.retry_after
+            except urllib.error.HTTPError as e:
+                if e.code not in RETRY_STATUS:
+                    raise FetchError(f"HTTP {e.code} (non réessayable) sur {url}") from e
+                last, hint = e, _retry_after(e.headers)
+            except (urllib.error.URLError, http.client.HTTPException, OSError) as e:
+                last = e
+            if attempt == self.s.max_retries:
+                break
+            delay = min(self.s.backoff_max, self.s.backoff_base**attempt) * random.uniform(0.5, 1.0)
+            if hint is not None:
+                delay = max(delay, min(hint, self.s.backoff_max))
+            log.warning("Tentative %d/%d échouée (%s), nouvel essai dans %.1fs : %s",
+                        attempt, self.s.max_retries, last, delay, url)
+            self._sleep(delay)
+        raise FetchError(f"Échec après {self.s.max_retries} tentatives : {url} ({last})") from last
+
+    # -- API publique -----------------------------------------------------
+    def get_json(self, url: str) -> Any:
+        def action() -> Any:
+            with self._open(self._request(url), timeout=self.s.timeout) as r:
+                raw = r.read()
+            try:
+                return json.loads(raw)
+            except ValueError as e:
+                raise _Retryable(f"JSON invalide : {e}") from e
+
+        return self._with_retries(url, action)
+
+    def download(self, url: str, dest: Path) -> tuple[str, int]:
+        """Télécharge vers `dest` (écrasé à chaque tentative). Retourne (sha256, taille)."""
+        dest.parent.mkdir(parents=True, exist_ok=True)
+
+        def action() -> tuple[str, int]:
+            digest, size = hashlib.sha256(), 0
+            with self._open(self._request(url), timeout=self.s.timeout) as r, dest.open("wb") as f:
+                while chunk := r.read(self.s.chunk_size):
+                    f.write(chunk)
+                    digest.update(chunk)
+                    size += len(chunk)
+                expected = r.headers.get("Content-Length") if r.headers else None
+                if expected is not None and int(expected) != size:
+                    raise _Retryable(f"Téléchargement tronqué : {size} octets reçus sur {expected}")
+                f.flush()
+                os.fsync(f.fileno())
+            return digest.hexdigest(), size
+
+        return self._with_retries(url, action)
+
+================================================================================
+FILE: src/medtech_edge/ingestion/config.py
+================================================================================
+"""Configuration de l'ingestion openFDA (dispositifs médicaux)."""
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+
+SOURCE = "openfda"
+DOWNLOAD_INDEX_URL = "https://api.fda.gov/download.json"
+# Seuls ces hôtes sont autorisés pour les fichiers (protège contre un index altéré).
+ALLOWED_DOWNLOAD_HOSTS = frozenset({"download.open.fda.gov"})
+USER_AGENT = "medtech-edge/0.1 (recherche personnelle)"
+
+
+@dataclass(frozen=True)
+class Endpoint:
+    name: str         # nom local, utilisé dans l'arborescence
+    category: str     # catégorie openFDA (ici "device")
+    key: str          # clé correspondante dans download.json
+    description: str
+
+
+ENDPOINTS: dict[str, Endpoint] = {
+    e.name: e
+    for e in (
+        Endpoint("510k", "device", "510k", "Autorisations 510(k)"),
+        Endpoint("pma", "device", "pma", "Approbations PMA"),
+        Endpoint("recall", "device", "recall", "Rappels de dispositifs"),
+        Endpoint("enforcement", "device", "enforcement", "Rappels classés (enforcement)"),
+        Endpoint("classification", "device", "classification", "Classification des produits"),
+        Endpoint("registrationlisting", "device", "registrationlisting", "Registrations et listings"),
+        Endpoint("event", "device", "event", "MAUDE : incidents déclarés (volumineux)"),
+        Endpoint("udi", "device", "udi", "GUDID / UDI (volumineux)"),
+    )
+}
+
+# Les jeux volumineux (event, udi, registrationlisting) sont à demander explicitement.
+DEFAULT_ENDPOINTS = ("510k", "pma", "recall", "enforcement", "classification")
+
+
+@dataclass(frozen=True)
+class Settings:
+    raw_dir: Path = Path("data/raw")
+    max_retries: int = 6
+    backoff_base: float = 2.0
+    backoff_max: float = 60.0
+    timeout: float = 60.0
+    chunk_size: int = 1 << 20
+    min_interval: float = 0.5  # secondes minimum entre deux requêtes
+
+    @property
+    def manifest_path(self) -> Path:
+        return self.raw_dir / "_manifest.jsonl"
+
+    @property
+    def tmp_dir(self) -> Path:
+        return self.raw_dir / ".tmp"
+
+================================================================================
+FILE: src/medtech_edge/ingestion/storage.py
+================================================================================
+"""Stockage immuable : écriture atomique, lecture seule, manifeste append-only."""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+from pathlib import Path
+from typing import Any
+
+
+def safe_segment(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]", "_", value)
+
+
+def sha256_file(path: Path, chunk: int = 1 << 20) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        while block := f.read(chunk):
+            h.update(block)
+    return h.hexdigest()
+
+
+def _fsync_dir(directory: Path) -> None:
+    try:
+        fd = os.open(directory, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def publish_readonly(tmp: Path, final: Path) -> None:
+    """Déplace `tmp` vers `final` sans jamais écraser, puis passe en lecture seule."""
+    final.parent.mkdir(parents=True, exist_ok=True)
+    os.chmod(tmp, 0o444)
+    try:
+        os.link(tmp, final)  # atomique ; échoue si `final` existe déjà
+    except FileExistsError:
+        raise
+    except OSError:  # système de fichiers sans liens physiques
+        if final.exists():
+            raise FileExistsError(final)
+        os.replace(tmp, final)
+    else:
+        os.unlink(tmp)
+    _fsync_dir(final.parent)
+
+
+class Manifest:
+    """Journal JSONL append-only : une ligne par fichier brut référencé."""
+
+    def __init__(self, path: Path):
+        self.path = path
+
+    def append(self, record: dict[str, Any]) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        line = json.dumps(record, sort_keys=True, ensure_ascii=False)
+        with self.path.open("a", encoding="utf-8") as f:
+            f.write(line + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+
+    def records(self) -> list[dict[str, Any]]:
+        if not self.path.exists():
+            return []
+        out = []
+        with self.path.open(encoding="utf-8") as f:
+            for n, line in enumerate(f, 1):
+                if not line.strip():
+                    continue
+                try:
+                    out.append(json.loads(line))
+                except ValueError as e:
+                    raise ValueError(f"Manifeste corrompu ligne {n} : {e}") from e
+        return out
+
+    def by_path(self) -> dict[str, dict[str, Any]]:
+        return {r["path"]: r for r in self.records()}
+
+================================================================================
+FILE: src/medtech_edge/ingestion/verify.py
+================================================================================
+"""Contrôles d'intégrité des fichiers bruts."""
+from __future__ import annotations
+
+import zipfile
+import zlib
+from pathlib import Path
+from typing import Any
+
+
+class IntegrityError(RuntimeError):
+    pass
+
+
+def verify_zip(path: Path) -> dict[str, Any]:
+    """Vérifie le zip (CRC de tout le contenu) et la forme openFDA du JSON interne."""
+    try:
+        with zipfile.ZipFile(path) as z:
+            members = [i for i in z.infolist() if i.filename.endswith(".json")]
+            if len(members) != 1:
+                raise IntegrityError(f"{path.name} : 1 fichier .json attendu, {len(members)} trouvé(s)")
+            bad = z.testzip()
+            if bad is not None:
+                raise IntegrityError(f"{path.name} : CRC invalide pour {bad}")
+            with z.open(members[0]) as f:
+                head = f.read(65536).decode("utf-8", "replace")
+            if '"meta"' not in head or '"results"' not in head:
+                raise IntegrityError(f"{path.name} : structure openFDA (meta/results) absente")
+            return {"member": members[0].filename, "uncompressed_bytes": members[0].file_size}
+    except (zipfile.BadZipFile, zlib.error, EOFError) as e:
+        raise IntegrityError(f"{path.name} : archive illisible ({e})") from e
+
+================================================================================
+FILE: src/medtech_edge/__init__.py
+================================================================================
+__version__ = "0.1.0"
+
+================================================================================
+FILE: tests/test_ingestion.py
+================================================================================
+import io
+import json
+import stat
+import tempfile
+import unittest
+import urllib.error
+import zipfile
+from pathlib import Path
+
+from medtech_edge.ingestion import bulk
+from medtech_edge.ingestion.client import FdaClient, FetchError
+from medtech_edge.ingestion.config import DOWNLOAD_INDEX_URL, ENDPOINTS, Settings
+from medtech_edge.ingestion.storage import Manifest, sha256_file
+
+FILE_URL = "https://download.open.fda.gov/device/510k/device-510k-0001-of-0001.json.zip"
+
+
+def make_zip() -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("device-510k-0001-of-0001.json",
+                   json.dumps({"meta": {"last_updated": "2026-09-30"}, "results": [{"k_number": "K000001"}] * 50}))
+    return buf.getvalue()
+
+
+def index_json(file_url: str = FILE_URL) -> bytes:
+    return json.dumps({"meta": {}, "results": {"device": {"510k": {
+        "export_date": "2026-09-30",
+        "partitions": [{"display_name": "x", "file": file_url, "size_mb": "0.01", "records": 50}]}}}}).encode()
+
+
+def http_error(code: int) -> urllib.error.HTTPError:
+    return urllib.error.HTTPError(FILE_URL, code, "err", {"Retry-After": "0"}, None)
+
+
+class FakeResp:
+    def __init__(self, body: bytes, headers=None):
+        self._b, self.headers = io.BytesIO(body), headers or {}
+
+    def read(self, n=-1):
+        return self._b.read(n)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+class FakeNet:
+    """Réponses par URL ; le dernier élément de chaque file est 'collant'."""
+
+    def __init__(self, routes):
+        self.routes = {u: list(v) for u, v in routes.items()}
+        self.calls = []
+
+    def __call__(self, req, timeout=None):
+        url = req.full_url
+        self.calls.append(url)
+        q = self.routes[url]
+        item = q.pop(0) if len(q) > 1 else q[0]
+        if isinstance(item, Exception):
+            raise item
+        body, headers = item if isinstance(item, tuple) else (item, {})
+        return FakeResp(body, headers)
+
+
+class IngestionTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.s = Settings(raw_dir=Path(self._tmp.name) / "raw", max_retries=3,
+                          backoff_base=1.0, backoff_max=0.0, min_interval=0.0, timeout=1)
+
+    def client(self, net):
+        return FdaClient(self.s, opener=net, sleep=lambda s: None)
+
+    def run_fetch(self, net):
+        return bulk.run(self.client(net), self.s, [ENDPOINTS["510k"]])
+
+    def dest(self):
+        return self.s.raw_dir / "openfda/device/510k/2026-09-30/device-510k-0001-of-0001.json.zip"
+
+    def test_telechargement_ok_lecture_seule_et_manifeste(self):
+        z = make_zip()
+        net = FakeNet({DOWNLOAD_INDEX_URL: [index_json()], FILE_URL: [(z, {"Content-Length": str(len(z))})]})
+        (r,) = self.run_fetch(net)
+        self.assertEqual(r.status, "downloaded")
+        self.assertEqual(stat.S_IMODE(self.dest().stat().st_mode) & 0o222, 0)
+        (rec,) = Manifest(self.s.manifest_path).records()
+        self.assertEqual(rec["sha256"], sha256_file(self.dest()))
+        self.assertEqual(rec["expected_records"], 50)
+        self.assertEqual(list(self.s.tmp_dir.glob("*")), [])
+        self.assertEqual(bulk.verify_all(self.s), [])
+
+    def test_idempotence_aucun_retelechargement(self):
+        net = FakeNet({DOWNLOAD_INDEX_URL: [index_json()], FILE_URL: [make_zip()]})
+        self.run_fetch(net)
+        net.calls.clear()
+        (r,) = self.run_fetch(net)
+        self.assertEqual(r.status, "skipped")
+        self.assertNotIn(FILE_URL, net.calls)
+        self.assertEqual(len(Manifest(self.s.manifest_path).records()), 1)
+
+    def test_retry_sur_503_puis_succes(self):
+        net = FakeNet({DOWNLOAD_INDEX_URL: [index_json()], FILE_URL: [http_error(503), make_zip()]})
+        (r,) = self.run_fetch(net)
+        self.assertEqual(r.status, "downloaded")
+        self.assertEqual(net.calls.count(FILE_URL), 2)
+
+    def test_404_non_reessaye(self):
+        net = FakeNet({DOWNLOAD_INDEX_URL: [index_json()], FILE_URL: [http_error(404)]})
+        (r,) = self.run_fetch(net)
+        self.assertEqual(r.status, "failed")
+        self.assertEqual(net.calls.count(FILE_URL), 1)
+
+    def test_archive_tronquee_rejetee_rien_ecrit(self):
+        z = make_zip()
+        net = FakeNet({DOWNLOAD_INDEX_URL: [index_json()], FILE_URL: [z[: len(z) // 2]]})
+        (r,) = self.run_fetch(net)
+        self.assertEqual(r.status, "failed")
+        self.assertFalse(self.dest().exists())
+        self.assertEqual(Manifest(self.s.manifest_path).records(), [])
+        self.assertEqual(list(self.s.tmp_dir.glob("*")), [])
+
+    def test_archive_corrompue_crc_rejetee(self):
+        z = bytearray(make_zip())
+        z[40] ^= 0xFF  # altère les données compressées
+        net = FakeNet({DOWNLOAD_INDEX_URL: [index_json()], FILE_URL: [bytes(z)]})
+        (r,) = self.run_fetch(net)
+        self.assertEqual(r.status, "failed")
+        self.assertFalse(self.dest().exists())
+
+    def test_content_length_incoherent_reessaye_puis_echec(self):
+        z = make_zip()
+        net = FakeNet({DOWNLOAD_INDEX_URL: [index_json()], FILE_URL: [(z, {"Content-Length": str(len(z) + 10)})]})
+        (r,) = self.run_fetch(net)
+        self.assertEqual(r.status, "failed")
+        self.assertEqual(net.calls.count(FILE_URL), 3)
+        self.assertFalse(self.dest().exists())
+
+    def test_hote_non_autorise_refuse(self):
+        evil = "https://evil.example.com/x/a.json.zip"
+        net = FakeNet({DOWNLOAD_INDEX_URL: [index_json(evil)]})
+        with self.assertRaises(FetchError):
+            self.run_fetch(net)
+
+    def test_verify_detecte_alteration(self):
+        net = FakeNet({DOWNLOAD_INDEX_URL: [index_json()], FILE_URL: [make_zip()]})
+        self.run_fetch(net)
+        self.dest().chmod(0o644)
+        with self.dest().open("ab") as f:
+            f.write(b"x")
+        self.assertTrue(any("TAILLE" in p or "SHA256" in p for p in bulk.verify_all(self.s)))
+
+    def test_adoption_si_manifeste_perdu(self):
+        net = FakeNet({DOWNLOAD_INDEX_URL: [index_json()], FILE_URL: [make_zip()]})
+        self.run_fetch(net)
+        self.s.manifest_path.unlink()
+        (r,) = self.run_fetch(net)
+        self.assertEqual(r.status, "adopted")
+        self.assertEqual(len(Manifest(self.s.manifest_path).records()), 1)
+
+    def test_dry_run_n_ecrit_rien(self):
+        net = FakeNet({DOWNLOAD_INDEX_URL: [index_json()]})
+        (r,) = bulk.run(self.client(net), self.s, [ENDPOINTS["510k"]], dry_run=True)
+        self.assertEqual(r.status, "planned")
+        self.assertFalse(self.s.raw_dir.exists())
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+================================================================================
+FILE: .gitignore
+================================================================================
+__pycache__/
+*.egg-info/
+.venv/
+data/raw/*
+!data/raw/.gitkeep
+
+================================================================================
+FILE: pyproject.toml
+================================================================================
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "medtech-edge"
+version = "0.1.0"
+description = "Outil perso de recherche : patterns entre données réglementaires medtech et cours de bourse"
+requires-python = ">=3.10"
+dependencies = []  # ingestion 100 % bibliothèque standard
+
+[project.scripts]
+medtech-edge-ingest = "medtech_edge.ingestion.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+================================================================================
+FILE: README.md
+================================================================================
+# medtech-edge
+
+Outil perso de recherche : patterns entre données réglementaires medtech (FDA) et cours.
+
+## Ingestion (étape 1)
+
+Package `medtech_edge.ingestion` : télécharge les exports complets openFDA (`download.json`)
+vers `data/raw/`, sans dépendance externe (Python ≥ 3.10).
+
+```bash
+export PYTHONPATH=src            # ou: pip install -e .
+python -m medtech_edge.ingestion list                      # exports disponibles côté FDA
+python -m medtech_edge.ingestion fetch --dry-run           # planifier sans écrire
+python -m medtech_edge.ingestion fetch                     # 510k, pma, recall, enforcement, classification
+python -m medtech_edge.ingestion fetch --endpoints event   # MAUDE (volumineux)
+python -m medtech_edge.ingestion verify                    # recontrôle sha256 + zip de tout data/raw
+python -m unittest discover -s tests -v
+```
+
+## Garanties « sanctuarisées »
+
+- **Atomique** : téléchargement dans `data/raw/.tmp/`, vérification, puis publication sans écrasement.
+- **Vérifié avant publication** : taille (Content-Length), CRC du zip, structure `meta`/`results`.
+  Un fichier invalide n'atteint jamais `data/raw/`.
+- **Immuable** : fichiers en lecture seule, un snapshot par date d'export
+  (`openfda/device/<endpoint>/<export_date>/`), jamais retéléchargé ni modifié.
+- **Traçable** : `data/raw/_manifest.jsonl` (append-only) : url, sha256, taille, date, nb d'enregistrements annoncé.
+- **Robuste** : retries avec backoff exponentiel sur 429/5xx/timeouts, respect de `Retry-After`,
+  hôtes de téléchargement en liste blanche, un échec n'arrête pas les autres fichiers (code retour 1).
+- **Idempotent** : relancer est sans risque ; un fichier présent mais absent du manifeste est « adopté ».
+
+## Limites connues
+
+- Le nombre d'enregistrements annoncé par la FDA est stocké mais pas encore recompté dans le JSON.
+- Structure de `download.json` supposée d'après la doc openFDA : lancer `list` en premier pour la confirmer.

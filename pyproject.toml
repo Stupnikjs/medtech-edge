@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "medtech-edge"
+version = "0.1.0"
+description = "Outil perso de recherche : patterns entre données réglementaires medtech et cours de bourse"
+requires-python = ">=3.10"
+dependencies = []  # ingestion 100 % bibliothèque standard
+
+[project.scripts]
+medtech-edge-ingest = "medtech_edge.ingestion.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
